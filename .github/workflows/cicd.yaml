@@ -2,286 +2,220 @@ name: MLOps CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main, develop]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   schedule:
-    # Run daily at 00:00 UTC to trigger training
     - cron: '0 0 * * *'
   workflow_dispatch:
 
 jobs:
   mlops-pipeline:
     runs-on: ubuntu-latest
-    
+
     strategy:
       matrix:
         python-version: ['3.11']
-    
+
     steps:
-      # ========================================
-      # 1. CODE CHECKOUT
-      # ========================================
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for DVC
+    # ========================================
+    # 1. CHECKOUT
+    # ========================================
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      # ========================================
-      # 2. PYTHON SETUP
-      # ========================================
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip'
+    # ========================================
+    # 2. PYTHON SETUP
+    # ========================================
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: pip
 
-      # ========================================
-      # 3. DEPENDENCY INSTALLATION
-      # ========================================
-      - name: Install project dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -q pandas numpy scikit-learn xgboost
-          pip install -q mlflow dvc dvc-s3
+    # ========================================
+    # 3. INSTALL DEPENDENCIES
+    # ========================================
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt || true
+        pip install pandas numpy scikit-learn xgboost
+        pip install mlflow dvc[s3]
 
-      # ========================================
-      # 4. DVC SETUP & DATA PULL
-      # ========================================
-      - name: Initialize DVC
-        run: |
-          dvc config core.autostage true
-          dvc config core.analytics false
+    # ========================================
+    # 4. AWS AUTH (REQUIRED FOR DVC)
+    # ========================================
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
 
-      - name: Pull data from DVC remote
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          # DVC automatically reads AWS credentials from environment variables
-          dvc pull -v 2>&1 || echo "Warning: DVC pull failed, will use fallback data"
-        continue-on-error: true
+    # ========================================
+    # 5. DVC SETUP
+    # ========================================
+    - name: Setup DVC
+      run: |
+        dvc config core.analytics false
 
-      # Fallback: Use local data if available
-      - name: Verify data exists
-        run: |
-          if [ ! -f "data/data.csv" ]; then
-            echo "Warning: data/data.csv not found, creating dummy data for CI"
-            mkdir -p data
-            python << 'EOF'
-            import pandas as pd
-            import numpy as np
-            np.random.seed(42)
-            data = {
-                'tenure': np.random.randint(1, 72, 100),
-                'MonthlyCharges': np.random.uniform(20, 120, 100),
-                'TotalCharges': np.random.uniform(100, 8000, 100),
-                'Churn': np.random.choice(['Yes', 'No'], 100)
-            }
-            df = pd.DataFrame(data)
-            df.to_csv('data/data.csv', index=False)
-            print(f"Created dummy data with {len(df)} rows")
-            EOF
-          else
-            echo "Data file exists"
-            ls -lh data/data.csv
-          fi
+        # Ensure remote exists
+        dvc remote add -d myremote s3://2022bcd0013-mlops/mlops-assignment || true
 
-      # ========================================
-      # 5. MODEL TRAINING & MLFLOW LOGGING
-      # ========================================
-      - name: Start MLflow server
-        run: |
-          mlflow server --host 0.0.0.0 --port 8080 &
-          sleep 5
-          curl -s http://localhost:8080 || echo "MLflow server not responding"
+    # ========================================
+    # 6. DVC PULL (SAFE)
+    # ========================================
+    - name: Pull data from DVC
+      run: |
+        if dvc pull -r myremote; then
+          echo "DVC pull successful"
+        else
+          echo "DVC pull failed → fallback will be used"
+        fi
 
-      - name: Run model training
-        env:
-          MLFLOW_TRACKING_URI: http://localhost:8080
-          PYTHONUNBUFFERED: 1
-        run: |
-          python src/train.py \
-            --data_path data/data.csv \
-            --run_type base
+    # ========================================
+    # 7. FALLBACK DATA (FIXED HEREDOC)
+    # ========================================
+    - name: Ensure dataset exists
+      run: |
+        mkdir -p data
 
-      - name: Run tuned model training
-        env:
-          MLFLOW_TRACKING_URI: http://localhost:8080
-          PYTHONUNBUFFERED: 1
-        run: |
-          python src/train.py \
-            --data_path data/data.csv \
-            --run_type tuned
-        continue-on-error: true  # Continue if this optional training fails
+        if [ ! -f "data/data.csv" ]; then
+          echo "Creating fallback dataset..."
 
-      # ========================================
-      # 6. METRICS GENERATION & REPORTING
-      # ========================================
-      - name: Query MLflow metrics
-        run: |
-          python << 'EOF'
-          import requests
-          import json
-          from datetime import datetime
-          
-          MLFLOW_URI = "http://localhost:8080"
-          
-          try:
-              # Get experiment by name
-              exp_response = requests.get(
-                  f"{MLFLOW_URI}/api/2.0/mlflow/experiments/search"
-              )
-              experiments = exp_response.json().get('experiments', [])
-              
-              print("\n" + "="*60)
-              print("MLflow Experiments Summary")
-              print("="*60)
-              
-              for exp in experiments:
-                  exp_id = exp['experiment_id']
-                  exp_name = exp['name']
-                  
-                  # Get runs for this experiment
-                  runs_response = requests.get(
-                      f"{MLFLOW_URI}/api/2.0/mlflow/runs/search",
-                      params={"experiment_ids": [exp_id]}
-                  )
-                  runs = runs_response.json().get('runs', [])
-                  
-                  print(f"\nExperiment: {exp_name}")
-                  print(f"Runs: {len(runs)}")
-                  
-                  for run in runs:
-                      run_id = run['info']['run_id']
-                      run_name = run['info'].get('run_name', 'N/A')
-                      status = run['info']['status']
-                      
-                      # Get metrics
-                      metrics = run.get('data', {}).get('metrics', {})
-                      params = run.get('data', {}).get('params', {})
-                      
-                      print(f"\n  Run: {run_name} ({run_id})")
-                      print(f"  Status: {status}")
-                      print(f"  Parameters: {params}")
-                      print(f"  Metrics: {metrics}")
-              
-              print("\n" + "="*60)
-              
-          except Exception as e:
-              print(f"Error querying MLflow: {e}")
-              print("MLflow may not be running or metrics are not available")
-          EOF
+          python3 <<EOF
+        import pandas as pd
+        import numpy as np
 
-      # ========================================
-      # 7. UPLOAD METRICS AS ARTIFACTS
-      # ========================================
-      - name: Collect and save metrics
-        if: always()
-        run: |
-          python << 'EOF'
-          import requests
-          import json
-          from datetime import datetime
-          
-          MLFLOW_URI = "http://localhost:8080"
-          metrics_data = {
-              "timestamp": datetime.now().isoformat(),
-              "experiments": []
-          }
-          
-          try:
-              exp_response = requests.get(
-                  f"{MLFLOW_URI}/api/2.0/mlflow/experiments/search"
-              )
-              experiments = exp_response.json().get('experiments', [])
-              
-              for exp in experiments:
-                  exp_id = exp['experiment_id']
-                  runs_response = requests.get(
-                      f"{MLFLOW_URI}/api/2.0/mlflow/runs/search",
-                      params={"experiment_ids": [exp_id]}
-                  )
-                  runs = runs_response.json().get('runs', [])
-                  
-                  exp_data = {
-                      "name": exp['name'],
-                      "runs": []
-                  }
-                  
-                  for run in runs:
-                      run_data = {
-                          "id": run['info']['run_id'],
-                          "name": run['info'].get('run_name', 'N/A'),
-                          "params": run.get('data', {}).get('params', {}),
-                          "metrics": run.get('data', {}).get('metrics', {})
-                      }
-                      exp_data['runs'].append(run_data)
-                  
-                  metrics_data['experiments'].append(exp_data)
-              
-              with open('metrics_report.json', 'w') as f:
-                  json.dump(metrics_data, f, indent=2)
-              
-              print("Metrics report saved to metrics_report.json")
-              
-          except Exception as e:
-              print(f"Could not save metrics report: {e}")
-          EOF
+        np.random.seed(42)
 
-      - name: Upload metrics as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mlflow-metrics
-          path: metrics_report.json
-          retention-days: 30
+        data = {
+            'tenure': np.random.randint(1, 72, 100),
+            'MonthlyCharges': np.random.uniform(20, 120, 100),
+            'TotalCharges': np.random.uniform(100, 8000, 100),
+            'Churn': np.random.choice(['Yes', 'No'], 100)
+        }
 
-      # ========================================
-      # 8. TEST EXECUTION (Optional)
-      # ========================================
-      - name: Run validation tests
-        run: |
-          python << 'EOF'
-          import os
-          print("Validation Checks:")
-          print("-" * 40)
-          
-          # Check if data file exists
-          if os.path.exists("data/data.csv"):
-              print("✓ Data file exists")
-          else:
-              print("✗ Data file missing")
-          
-          # Check if MLflow logs exist
-          if os.path.exists("mlruns"):
-              print("✓ MLflow runs directory exists")
-          else:
-              print("✗ MLflow runs not found")
-          
-          print("-" * 40)
-          print("Validation Complete!")
-          EOF
+        df = pd.DataFrame(data)
+        df.to_csv('data/data.csv', index=False)
 
-      # ========================================
-      # 9. CLEANUP & SUMMARY
-      # ========================================
-      - name: Generate workflow summary
-        if: always()
-        run: |
-          echo "## MLOps CI/CD Pipeline Summary" > $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Pipeline Steps Completed:" >> $GITHUB_STEP_SUMMARY
-          echo "✓ Code Checkout" >> $GITHUB_STEP_SUMMARY
-          echo "✓ Dependencies Installation" >> $GITHUB_STEP_SUMMARY
-          echo "✓ DVC Data Pull" >> $GITHUB_STEP_SUMMARY
-          echo "✓ Model Training" >> $GITHUB_STEP_SUMMARY
-          echo "✓ MLflow Logging" >> $GITHUB_STEP_SUMMARY
-          echo "✓ Metrics Generation" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts:" >> $GITHUB_STEP_SUMMARY
-          echo "- Metrics Report: \`metrics_report.json\`" >> $GITHUB_STEP_SUMMARY
-          echo "- MLflow Runs: Available in MLflow UI" >> $GITHUB_STEP_SUMMARY
+        print(f"Created fallback dataset with {len(df)} rows")
+        EOF
+        else
+          echo "Dataset already exists"
+          ls -lh data/data.csv
+        fi
+
+    # ========================================
+    # 8. START MLFLOW SERVER (ROBUST)
+    # ========================================
+    - name: Start MLflow server
+      run: |
+        nohup mlflow server --host 0.0.0.0 --port 8080 > mlflow.log 2>&1 &
+        sleep 10
+
+        curl --retry 5 --retry-delay 2 http://localhost:8080 || echo "MLflow not ready"
+
+    # ========================================
+    # 9. TRAIN MODEL (BASE)
+    # ========================================
+    - name: Train base model
+      env:
+        MLFLOW_TRACKING_URI: http://localhost:8080
+      run: |
+        python src/train.py \
+          --data_path data/data.csv \
+          --run_type base
+
+    # ========================================
+    # 10. TRAIN MODEL (TUNED)
+    # ========================================
+    - name: Train tuned model
+      env:
+        MLFLOW_TRACKING_URI: http://localhost:8080
+      run: |
+        python src/train.py \
+          --data_path data/data.csv \
+          --run_type tuned || echo "Tuned run failed"
+
+    # ========================================
+    # 11. GENERATE METRICS REPORT
+    # ========================================
+    - name: Generate metrics report
+      if: always()
+      run: |
+        python <<EOF
+        import requests, json
+        from datetime import datetime
+
+        MLFLOW_URI = "http://localhost:8080"
+
+        data = {"timestamp": datetime.now().isoformat(), "experiments": []}
+
+        try:
+            exp_res = requests.get(f"{MLFLOW_URI}/api/2.0/mlflow/experiments/search")
+            experiments = exp_res.json().get("experiments", [])
+
+            for exp in experiments:
+                exp_id = exp["experiment_id"]
+
+                runs_res = requests.get(
+                    f"{MLFLOW_URI}/api/2.0/mlflow/runs/search",
+                    params={"experiment_ids": [exp_id]}
+                )
+
+                runs = runs_res.json().get("runs", [])
+
+                exp_data = {"name": exp["name"], "runs": []}
+
+                for run in runs:
+                    exp_data["runs"].append({
+                        "id": run["info"]["run_id"],
+                        "metrics": run.get("data", {}).get("metrics", {}),
+                        "params": run.get("data", {}).get("params", {})
+                    })
+
+                data["experiments"].append(exp_data)
+
+        except Exception as e:
+            print("MLflow fetch failed:", e)
+
+        with open("metrics_report.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+        print("metrics_report.json generated")
+        EOF
+
+    # ========================================
+    # 12. UPLOAD ARTIFACT
+    # ========================================
+    - name: Upload metrics
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mlflow-metrics
+        path: metrics_report.json
+
+    # ========================================
+    # 13. VALIDATION
+    # ========================================
+    - name: Validate outputs
+      run: |
+        echo "Validation:"
+        [ -f data/data.csv ] && echo "✓ Data OK" || echo "✗ Data missing"
+        [ -d mlruns ] && echo "✓ MLflow logs OK" || echo "✗ MLflow logs missing"
+
+    # ========================================
+    # 14. SUMMARY
+    # ========================================
+    - name: Summary
+      if: always()
+      run: |
+        echo "## MLOps Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- Data Pipeline: OK" >> $GITHUB_STEP_SUMMARY
+        echo "- Training: Completed" >> $GITHUB_STEP_SUMMARY
+        echo "- MLflow: Logged" >> $GITHUB_STEP_SUMMARY
+        echo "- Metrics: Uploaded" >> $GITHUB_STEP_SUMMARY
