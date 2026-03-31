@@ -13,7 +13,7 @@ import os
 # ARGUMENTS
 # -------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--data_path", type=str, default="data/data.csv")
+parser.add_argument("--data_path", type=str, default="data/data_v2.csv")
 parser.add_argument("--run_type", type=str, default="base")  # base / tuned
 args = parser.parse_args()
 
@@ -64,7 +64,7 @@ if args.run_type == "base":
     model = XGBClassifier(
         random_state=42,
         n_estimators=100,
-        max_depth=5,
+        max_depth=3,
         learning_rate=0.1,
         eval_metric="logloss",
         use_label_encoder=False
