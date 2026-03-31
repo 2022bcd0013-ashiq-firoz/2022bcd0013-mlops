@@ -63,8 +63,8 @@ X_train, X_test, y_train, y_test = train_test_split(
 if args.run_type == "base":
     model = XGBClassifier(
         random_state=42,
-        n_estimators=100,
-        max_depth=3,
+        n_estimators=200,
+        max_depth=6,
         learning_rate=0.1,
         eval_metric="logloss",
         use_label_encoder=False
