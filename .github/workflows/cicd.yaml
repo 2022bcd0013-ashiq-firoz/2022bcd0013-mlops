@@ -42,15 +42,11 @@ jobs:
       # ========================================
       # 3. DEPENDENCY INSTALLATION
       # ========================================
-      - name: Install uv package manager
-        run: |
-          pip install --upgrade pip
-          pip install uv
-
       - name: Install project dependencies
         run: |
-          uv pip install -q pandas numpy scikit-learn xgboost
-          uv pip install -q mlflow dvc dvc-s3
+          pip install --upgrade pip
+          pip install -q pandas numpy scikit-learn xgboost
+          pip install -q mlflow dvc dvc-s3
 
       # ========================================
       # 4. DVC SETUP & DATA PULL
