@@ -114,10 +114,16 @@ jobs:
     # ========================================
     - name: Start MLflow server
       run: |
-        nohup mlflow server --host 0.0.0.0 --port 8080 > mlflow.log 2>&1 &
-        sleep 10
+        mkdir -p mlruns
 
-        curl --retry 5 --retry-delay 2 http://localhost:8080 || echo "MLflow not ready"
+        nohup mlflow server \
+        --backend-store-uri file:./mlruns \
+        --default-artifact-root ./mlruns \
+        --host 0.0.0.0 \
+        --port 8080 > mlflow.log 2>&1 &
+
+        sleep 10
+        curl --retry 5 --retry-delay 2 http://localhost:8080
 
     # ========================================
     # 9. TRAIN MODEL (BASE)
