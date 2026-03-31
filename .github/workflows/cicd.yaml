@@ -56,23 +56,14 @@ jobs:
           dvc config core.autostage true
           dvc config core.analytics false
 
-      - name: Configure DVC with AWS credentials
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          # DVC reads AWS credentials from environment variables automatically
-          # Configure the remote (credentials come from env vars, not config)
-          dvc remote modify myremote access_key_id $AWS_ACCESS_KEY_ID
-          dvc remote modify myremote secret_access_key $AWS_SECRET_ACCESS_KEY
-
       - name: Pull data from DVC remote
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          dvc pull -v
-        continue-on-error: true  # Continue if no remote configured or data doesn't exist
+          # DVC automatically reads AWS credentials from environment variables
+          dvc pull -v 2>&1 || echo "Warning: DVC pull failed, will use fallback data"
+        continue-on-error: true
 
       # Fallback: Use local data if available
       - name: Verify data exists
