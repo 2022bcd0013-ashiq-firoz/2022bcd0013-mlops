@@ -48,6 +48,10 @@ else:
 # -------------------------
 # MLFLOW SETUP
 # -------------------------
+mlflow.set_tracking_uri(
+    os.getenv("MLFLOW_TRACKING_URI", "http://localhost:8080")
+)
+
 mlflow.set_experiment("mlops_assignment_model_1_data_1")
 
 with mlflow.start_run():
