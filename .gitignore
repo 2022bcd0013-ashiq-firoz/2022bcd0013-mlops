@@ -10,3 +10,5 @@ data.csv
 .mlruns/
 mlruns/
 *.log
+
+model.pkl
